@@ -8,7 +8,7 @@
 
 #define _READN(__read, __assert, __fd, __buf, __len)               \
   for (int __k, __l = 0;;) {                                       \
-    __k = read(__fd, __buf + __l, __len - __l);                    \
+    __k = __read(__fd, __buf + __l, __len - __l);                  \
     ASSERT(__k, __fd);                                             \
     __l += __k;                                                    \
     if (__l < __len) YLD(); else break;                            \
@@ -29,7 +29,7 @@
 
 #define _WRITEN(__write, __assert, __fd, __buf, __len) \
   for (int __k, __l = 0;;) {                           \
-    __k = write(__fd, __buf + __l, __len - __l);       \
+    __k = __write(__fd, __buf + __l, __len - __l);     \
     __assert(__k, __fd);                               \
     __l += __k;                                        \
     if (__l < __len) YLD(); else break;                \
