@@ -18,7 +18,7 @@
 
 #define SA struct sockaddr
 
-struct tinfo ti[NUM_THREADS];
+struct tinfo* ti;
 unsigned long page_size;
 unsigned long page_mask;
 
@@ -160,7 +160,7 @@ static void sigint_sigaction(int sig) {
   W("\nShutting down the server...\n");
 }
 
-void server_run(struct serv_desc* desc_array_zero_terminated) {
+void server_run(struct serv_desc* desc_array_zero_terminated, int num_threads) {
   int num_descs;
   int epoll_fd, connfd; // sockets
   int i, j, k;
@@ -175,7 +175,10 @@ void server_run(struct serv_desc* desc_array_zero_terminated) {
   uint64_t stacks_map_size = CLIENTS_PER_THREAD * ((RED_ZONE_STACK_SIZE & page_mask) + (MAX_STACK_SIZE & page_mask));
   intptr_t stack_space = (MAX_STACK_SIZE & page_mask) + (RED_ZONE_STACK_SIZE & page_mask);
 
-  memset(ti, 0, NUM_THREADS * sizeof(struct tinfo));
+  if (num_threads <= 0)
+    num_threads = DEFAULT_NUM_THREADS;
+
+  ti = (struct tinfo*)calloc(num_threads, sizeof(struct tinfo));
 
   memset(&sigact, 0, sizeof(struct sigaction));
   sigemptyset(&sigact.sa_mask);
@@ -189,7 +192,7 @@ void server_run(struct serv_desc* desc_array_zero_terminated) {
   sigact.sa_flags = SA_SIGINFO | SA_ONSTACK;
   sigaction(SIGSEGV, &sigact, NULL);
 
-  for (i = 0; i < NUM_THREADS; i++) {
+  for (i = 0; i < num_threads; i++) {
     ti[i].epoll_fd = epoll_create1(0);
     I("T%u poll fd: %d\n", i, ti[i].epoll_fd);
 
@@ -286,7 +289,7 @@ void server_run(struct serv_desc* desc_array_zero_terminated) {
       } else {
         I("Socket %d accepted\n", connfd);
         do {
-          i = (i + 1) % NUM_THREADS; // Fly Robbin, fly.
+          i = (i + 1) % num_threads; // Fly Robbin, fly.
           j = _semiatomic_pop_slot(ti + i);
         } while (j < 0);
 
@@ -320,10 +323,10 @@ void server_run(struct serv_desc* desc_array_zero_terminated) {
     }
   }
 
-  for (i = 0; i < NUM_THREADS; i++)
+  for (i = 0; i < num_threads; i++)
     ti[i].enabled = 0;
 
-  for (i = 0; i < NUM_THREADS; i++) {
+  for (i = 0; i < num_threads; i++) {
     pthread_join(ti[i].tid, NULL);
     close(ti[i].epoll_fd);
     munmap(ti[i].stack_address_space, stacks_map_size);
@@ -332,5 +335,6 @@ void server_run(struct serv_desc* desc_array_zero_terminated) {
   close(epoll_fd);
   for (desc = desc_array_zero_terminated; desc->process; desc++)
     close(desc->_fd);
+  free(ti);
   I("The end\n");
 }

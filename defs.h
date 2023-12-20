@@ -25,7 +25,7 @@ struct serv_desc {
 
 void task_yld();
 void task_end();
-void server_run(struct serv_desc* desc_array_zero_terminated);
+void server_run(struct serv_desc* desc_array_zero_terminated, int num_threads);
 
 struct tinfo {
   pthread_t tid; // OS thread ID.

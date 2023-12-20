@@ -23,11 +23,12 @@ void process(const struct client_state* c) {
     READSEP(l, sspl, c->fd, buf, BUF_SIZE -1, "\r\n", 2);
     if (l) {
       WRITEN(c->fd, buf, l);
+      YLD();
     }
   }
 }
 
-int main() {
+int main(int argc, char *argv[]) {
   struct serv_desc srv[] = {
     {
     .process = process,
@@ -39,5 +40,12 @@ int main() {
     }
   };
 
-  server_run(srv);
+  int num_threads = 0;
+
+  // Num of working threads
+  if (argc > 1) {
+    num_threads = atoi(argv[1]);
+  }
+
+  server_run(srv, num_threads);
 }

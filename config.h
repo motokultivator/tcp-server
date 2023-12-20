@@ -1,4 +1,4 @@
-#define NUM_THREADS          4
+#define DEFAULT_NUM_THREADS  4
 #define CLIENTS_PER_THREAD   100
 #define MAX_STACK_SIZE       (1024 * 1024 * 10)
 #define MIN_STACK_SIZE       4096
