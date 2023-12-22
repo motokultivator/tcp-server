@@ -22,6 +22,15 @@ void process(const struct client_state* c) {
   while (1) {
     READSEP(l, sspl, c->fd, buf, BUF_SIZE -1, "\r\n", 2);
     if (l) {
+      buf[l] = 0;
+      PGresult* res = pq_exec_params("select 22 as tt", 0, NULL, NULL, NULL, NULL, 0);
+      if (res == NULL) {
+        printf("Query error\n\n");
+      } else {
+        printf("Query Status: %d\n", PQresultStatus(res));
+        printf("Res value: %s\n", PQgetvalue(res, 0, 0));
+        PQclear(res);
+      }
       WRITEN(c->fd, buf, l);
       YLD();
     }
@@ -47,5 +56,5 @@ int main(int argc, char *argv[]) {
     num_threads = atoi(argv[1]);
   }
 
-  server_run(srv, num_threads, NULL);
+  server_run(srv, num_threads, "dbname=test sslmode=disable user=test password=test");
 }

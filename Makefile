@@ -6,6 +6,9 @@ example_echo_client: example_echo_client.c afewmacros.h
 example_echo_server: example_echo_server.c defs.h server.o context.o afewmacros.h config.h
 	gcc example_echo_server.c server.o context.o -lpthread -o example_echo_server
 
+example_pg_echo_server: example_pg_echo_server.c defs.h server.c context.o afewmacros.h config.h
+	gcc -g -DUSE_PSQL -I/usr/include/postgresql example_pg_echo_server.c server.c context.o -lpq -lpthread -o example_pg_echo_server
+
 example_echo_server_aarch64: example_echo_server.c defs.h server.c context_aarch64.o afewmacros.h config.h
 	aarch64-linux-gnu-gcc example_echo_server.c server.c context_aarch64.o -lpthread -o example_echo_server_aarch64
 

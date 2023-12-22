@@ -18,6 +18,9 @@
 
 #define SA struct sockaddr
 
+#define IN_USE_LIVE       1
+#define IN_USE_WAITING_DB 2
+
 struct tinfo* ti;
 unsigned long page_size;
 unsigned long page_mask;
@@ -60,8 +63,9 @@ static inline void _task_end(struct tinfo* ti, uint32_t j) {
   }
 
   close(ti->cs[j].fd);
-  ti->cs[j]._in_use = 0;
-  swap_ctx(ti->ctx[j]);
+  ti->cs[j]._in_use_flags = ti->cs[j]._in_use_flags & ~IN_USE_LIVE;
+  do { swap_ctx(ti->ctx[j]); }
+    while (ti->cs[j]._in_use_flags != 0);
 }
 
 static void task_wrap(entry_ptr entry, struct tinfo* ti, uint32_t j) {
@@ -81,10 +85,56 @@ void task_end() { // Experimental
   _task_end(self, current_client);
 }
 
-static void* worker(struct tinfo *ti) {
+#if defined(USE_PSQL)
+PGresult* pq_exec_params(const char *command,
+                         int n_params,
+                         const Oid *param_types,
+                         const char * const *param_values,
+                         const int *param_lengths,
+                         const int *param_formats,
+                         int result_format) {
+  PGresult* res;
+  if ((self->cs[current_client]._in_use_flags & IN_USE_WAITING_DB) != 0) {
+    W("T%u Already waiting for DB result\n", self->id);
+    return NULL;
+  }
+
+  if (PQsendQueryParams(self->conn, command, n_params, param_types,
+      param_values, param_lengths, param_formats, result_format) != 1
+      || PQpipelineSync(self->conn) != 1) {
+    W("T%u Database error: %s\n", self->id, PQerrorMessage(self->conn));
+    exit(EXIT_FAILURE);
+  }
+
+  self->queue[self->qin] = current_client;
+  self->qin = (self->qin + 1) % CLIENTS_PER_THREAD;
+
+  self->cs[current_client]._in_use_flags |= IN_USE_WAITING_DB;
+  swap_ctx(self->ctx[current_client]);
+  res = self->current_res;
+  self->current_res = NULL;
+  return res;
+}
+#endif
+
+static inline void _switch_to(struct tinfo* ti, uint32_t client) {
+  // Note: This is the exclusive place where current_client is being set.
+  current_client = client;
+  I("T%u Switcing to %u...\n", ti->id, current_client);
+  if (ti->cs[current_client]._in_use_flags & IN_USE_LIVE)
+    swap_ctx(ti->ctx[current_client]);
+  if (ti->cs[current_client]._in_use_flags == 0) {
+    _semiatomic_push_slot(ti, current_client);
+  }
+  I("T%u Came back from %u!\n", ti->id, current_client);
+}
+
+static void* worker(struct tinfo* ti) {
   uint32_t j, n;
 
-  self = ti;
+#if defined(USE_PSQL)
+  struct epoll_event ev;
+#endif
 
   stack_t ss, ss_old;
   // A stack in the stack.
@@ -95,6 +145,7 @@ static void* worker(struct tinfo *ti) {
     exit(EXIT_FAILURE);
   }
 
+  self = ti;
   ss.ss_size = SIGSTKSZ;
   ss.ss_flags = 0;
 
@@ -102,6 +153,23 @@ static void* worker(struct tinfo *ti) {
     W("T%u sigaltstack failed\n", ti->id);
     exit(EXIT_FAILURE);
   }
+
+#if defined(USE_PSQL)
+  ti->conn = PQconnectdb(ti->conn_info);
+  if (PQstatus(ti->conn) != CONNECTION_OK || PQenterPipelineMode(ti->conn) != 1 || PQsetnonblocking(ti->conn, 1) != 0) {
+    W("T%u Connection to database failed: %s", ti->id, PQerrorMessage(ti->conn));
+    PQfinish(ti->conn);
+    exit(EXIT_FAILURE);
+  }
+  ti->qin = 0; // the first emtpy slot
+  ti->qout = 0; // the last used slot
+  ev.events = EPOLLIN; // TODO: check this
+  ev.data.ptr = NULL;
+  if (epoll_ctl(ti->epoll_fd, EPOLL_CTL_ADD, PQsocket(ti->conn), &ev) == -1) {
+    W("T%u epoll_ctl: conn_sock\n", ti->id);
+    exit(EXIT_FAILURE);
+  }
+#endif
 
   while (ti->enabled) {
     I("T%u polling\n", ti->id);
@@ -115,22 +183,46 @@ static void* worker(struct tinfo *ti) {
     }
 
     for (n = 0; n < nfds; ++n) {
-      current_client = *((uint32_t*)ti->events[n].data.ptr); // Note: This is the exclusive place where current_client is being set.
-      ti->cs[current_client].last_epoll_fd = *((int*)(((uint32_t*)ti->events[n].data.ptr) + 1)); // better
-      ti->cs[current_client].flags = ti->events[n].events;
-      I("T%u Switcing to %u...\n", ti->id, current_client);
-      swap_ctx(ti->ctx[current_client]);
-      if (!ti->cs[current_client]._in_use) {
-        _semiatomic_push_slot(ti, current_client);
+#if defined(USE_PSQL)
+      if (ti->events[n].data.ptr == NULL) {
+        PQconsumeInput(ti->conn);
+        if (PQisBusy(ti->conn))
+          continue;
+        do {
+          PGresult* res = PQgetResult(ti->conn);
+          if (res != NULL) {
+            int s = PQresultStatus(res);
+            if (s == PGRES_PIPELINE_SYNC || s == PGRES_COPY_OUT || s == PGRES_COPY_IN ||
+                s == PGRES_NONFATAL_ERROR || s == PGRES_COPY_BOTH) {
+                I("T%u Database info (status: %d): %s\n", ti->id, s, PQerrorMessage(ti->conn));
+              PQclear(res);
+            } else if (s <= PGRES_TUPLES_OK) {
+              uint32_t c = ti->queue[ti->qout];
+              ti->qout = (ti->qout + 1) % CLIENTS_PER_THREAD;
+              ti->cs[c]._in_use_flags &= ~IN_USE_WAITING_DB;
+              if ((ti->cs[c]._in_use_flags & IN_USE_LIVE) == 0)
+                PQclear(res);
+              ti->current_res = res;
+              _switch_to(ti, c);
+            } else {
+              W("T%u Database fatal/unsupported (status: %d): %s\n", ti->id, s, PQerrorMessage(ti->conn));
+              exit(EXIT_FAILURE);
+            }
+          }
+        } while (!PQisBusy(ti->conn));
+      } else if ((ti->cs[*((uint32_t*)ti->events[n].data.ptr)]._in_use_flags & IN_USE_WAITING_DB) == 0)
+#endif
+      {
+        ti->cs[*((uint32_t*)ti->events[n].data.ptr)].flags = ti->events[n].events;
+        _switch_to(ti, *((uint32_t*)ti->events[n].data.ptr));
       }
-      I("T%u Came back from %u!\n", ti->id, current_client);
     }
   }
   // TODO: Add watchdog or connection timeot.
   I("T%u is going to die\n", ti->id);
 
   for (j = 0; j < CLIENTS_PER_THREAD; j++) {
-    if (ti->cs[j]._in_use) {
+    if (ti->cs[j]._in_use_flags & IN_USE_LIVE) {
       I("T%u:%u Closing fd: %d\n", ti->id, j, ti->cs[j].fd);
       close(ti->cs[j].fd);
     }
@@ -139,7 +231,7 @@ static void* worker(struct tinfo *ti) {
   I("T%u ends\n", ti->id);
 }
 
-static void segfault_sigaction(int signal, siginfo_t *si, void *arg) {
+static void segfault_sigaction(int signal, siginfo_t* si, void* arg) {
   // Note: Here we have only SIGSTKSZ (usually 8192) bytes of a stack and have no overflow protection.
   // Anyway, it is far enough to call mprotect().
   // I("T%u:%u Segfault %p\n", self->id, current_client, si->si_addr);
@@ -160,7 +252,7 @@ static void sigint_sigaction(int sig) {
   W("\nShutting down the server...\n");
 }
 
-void server_run(struct serv_desc* desc_array_zero_terminated, int num_threads) {
+void server_run(struct serv_desc* desc_array_zero_terminated, int num_threads, const char* conn_info) {
   int num_descs;
   int epoll_fd, connfd; // sockets
   int i, j, k;
@@ -212,7 +304,7 @@ void server_run(struct serv_desc* desc_array_zero_terminated, int num_threads) {
       mprotect(ti[i].stack[j] + (MAX_STACK_SIZE & page_mask) - (MIN_STACK_SIZE & page_mask), MIN_STACK_SIZE & page_mask,
                PROT_WRITE | PROT_READ);
       ti[i].slots[j] = j;
-      ti[i].cs[j]._in_use = 0;
+      ti[i].cs[j]._in_use_flags = 0;
       ti[i].cs[j].id = j;
     }
 
@@ -220,7 +312,9 @@ void server_run(struct serv_desc* desc_array_zero_terminated, int num_threads) {
 
     ti[i].enabled = 1;
     ti[i].id = i;
-
+#if defined(USE_PSQL)
+    ti[i].conn_info = conn_info;
+#endif
     if (pthread_create(&ti[i].tid, NULL, (void * (*)(void *))&worker, &ti[i])) {
       W("T%u pthread_create failed...\n", i);
       exit(EXIT_FAILURE);
@@ -305,7 +399,7 @@ void server_run(struct serv_desc* desc_array_zero_terminated, int num_threads) {
 
         fcntl(connfd, F_SETFL, O_NONBLOCK);
 
-        state->_in_use = 1;
+        state->_in_use_flags = IN_USE_LIVE;
         state->fd = connfd;
         // state->ip = cli.sin_addr.s_addr;
 
@@ -329,6 +423,9 @@ void server_run(struct serv_desc* desc_array_zero_terminated, int num_threads) {
   for (i = 0; i < num_threads; i++) {
     pthread_join(ti[i].tid, NULL);
     close(ti[i].epoll_fd);
+#if defined(USE_PSQL)
+    PQfinish(ti[i].conn);
+#endif
     munmap(ti[i].stack_address_space, stacks_map_size);
   }
 
